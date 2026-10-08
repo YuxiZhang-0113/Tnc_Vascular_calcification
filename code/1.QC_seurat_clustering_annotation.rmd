@@ -1,0 +1,373 @@
+---
+title: "1.Quality control, doublet detection, clustering and cell type annotation"
+author: "ZhangYuxi"
+date: "2026-10-08"
+output: html_document
+---
+
+# 1.1 functions
+
+```{r}
+mycolors1 <- unique(c("#C6DBEF","#9ECAE1",
+                      "#96D2A4","#B7E6A5","#7CCBA2",'#E59CC4','#DCC1DD',
+                      "#FF8C8D","#E75B64",
+                      "#FFCE4E","#EACF9E","#BBA78C",
+                      "#BCC7D2",
+                      "#AE93BE",'#CCC9E6',
+                      '#B53E2B',"#DF5C24","#DE7862", 
+                      "#92BBD9",'#CCE0F5',"#90BFF9",
+                      "#819A7A",'#53A85F',"#1F990F",'#C5DEBA',
+                      "#94C5CC",
+                      '#F7F398',
+                      "#EF9A9A","#E7969C","#E67E7E","#E67E8A","#EF5350",
+                      "#F7B6D2","#FFB2BC","#FFB2B2",
+                      "#BBDEFB","#92BBD9","#AEC7E8",
+                      "#B896D6","#B77DAF","#C5B0D5",
+                      "#80CBC4",
+                      "#819A7A","#A3C7BD","#CCCC99",
+                      "#8BC34A","#B5CF6B","#CEDB9C", "#DBDB8D","#C3E57E",
+                      "#BD9E39","#E7BA52","#EACF9E","#E7CB94","#E6C77E",
+                      "#DE7862","#FFAB91","#E5938A" ,
+                      "#FFCE4E","#FFF176","#FFE082",
+                      "#FFA000","#FDAE6B","#FFBB78",
+                      "#C49C94","#BCAAA4","#F2CEC0",
+                      "#CE6DBD","#9C9EDE"  , 
+                      "#7F7F7F","#C7C7C7",
+                      "#CC8E51","#E5B17E","#FFD8B2"))
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(tidyverse) 
+library(harmony)
+
+library(scDblFinder) 
+library(DoubletFinder)
+
+library(paletteer)
+
+add_meta <- function(sce,species) {
+  if (species == 'human') {
+    sce[['percent.mt']] <- PercentageFeatureSet(object = sce, pattern = '^MT-')
+    rps_genes <- row.names(sce)[grepl('^RPS', row.names(sce))]
+    mrp_genes <- row.names(sce)[grepl('^MRP', row.names(sce))]
+    rpl_genes <- row.names(sce)[grepl('^RPL', row.names(sce))]
+    rb_genes <- c(rps_genes, mrp_genes, rpl_genes)
+    C <- GetAssayData(object = sce, slot = 'counts')
+    percent.rp <- Matrix::colSums(C[rb_genes, ])/Matrix::colSums(C)*100
+    sce <- PercentageFeatureSet(sce, pattern = "^RPL", col.name = "percent.rpl") 
+    sce <- PercentageFeatureSet(sce, pattern = "^RPS", col.name = "percent.rps")
+    sce <- AddMetaData(sce, percent.rp, col.name = 'percent.rp')
+  }
+  
+  if (species == 'mouse') {
+    sce[['percent.mt']] <- PercentageFeatureSet(object = sce, pattern = '^mt-')
+    rps_genes <- row.names(sce)[grepl('^Rps', row.names(sce))]
+    mrp_genes <- row.names(sce)[grepl('^Mrp', row.names(sce))]
+    rpl_genes <- row.names(sce)[grepl('^Rpl', row.names(sce))]
+    rb_genes <- c(rps_genes, mrp_genes, rpl_genes)
+    C <- GetAssayData(object = sce, slot = 'counts')
+    percent.rp <- Matrix::colSums(C[rb_genes, ])/Matrix::colSums(C)*100
+    sce <- PercentageFeatureSet(sce, pattern = "^Rpl", col.name = "percent.rpl")
+    sce <- PercentageFeatureSet(sce, pattern = "^Rps", col.name = "percent.rps")
+    
+    sce <- AddMetaData(sce, percent.rp, col.name = 'percent.rp')
+  }
+  
+  if (species == 'rat') {
+    sce[['percent.mt']] <- PercentageFeatureSet(object = sce, pattern = '^Mt-')
+    rps_genes <- row.names(sce)[grepl('^Rps', row.names(sce))]
+    mrp_genes <- row.names(sce)[grepl('^Mrp', row.names(sce))]
+    rpl_genes <- row.names(sce)[grepl('^Rpl', row.names(sce))]
+    rb_genes <- c(rps_genes, mrp_genes, rpl_genes)
+    C <- GetAssayData(object = sce, slot = 'counts')
+    percent.rp <- Matrix::colSums(C[rb_genes, ])/Matrix::colSums(C)*100
+    sce <- PercentageFeatureSet(sce, pattern = "^Rpl", col.name = "percent.rpl")
+    sce <- PercentageFeatureSet(sce, pattern = "^Rps", col.name = "percent.rps")
+    
+    sce <- AddMetaData(sce, percent.rp, col.name = 'percent.rp')
+  }
+  sce@meta.data$log10GenesPerUMI <- log10(sce$nFeature_RNA) / log10(sce$nCount_RNA)
+  return(sce)
+}
+rundoublet <- function(sce, method, basis = "Demuxlet", custom_rate = NULL, assay = "RNA") {
+  if (method == "doubletfinder") {
+    library(DoubletFinder)
+    
+    sce<- sce %>% 
+      NormalizeData(verbose = FALSE) %>%
+      FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+      ScaleData()
+    sce <- sce %>%
+      RunPCA(npcs = 20, verbose = FALSE) %>%
+      FindNeighbors(dims = 1:20) %>%
+      FindClusters(resolution = 0.8)
+    sce <- RunUMAP(sce, dims=1:20)
+    sce <- RunTSNE(sce, dims = 1:20)
+    pk_best <- sce %>% 
+      paramSweep(PCs = 1:20,sct=FALSE) %>%
+      summarizeSweep(GT=FALSE) %>%
+      find.pK() %>%
+      dplyr::arrange(desc(BCmetric)) %>%
+      dplyr::pull(pK) %>%
+      .[1] %>% as.character() %>% as.numeric()
+    
+    if (basis == "10X") {
+      get_rate <- function(num) {
+        if (num < 800) {
+          return(0.004)
+        } else if (num >= 800 && num < 1600) {
+          return(0.008)
+        } else if (num >= 1600 && num < 3200) {
+          return(0.016)
+        } else if (num >= 3200 && num < 4800) {
+          return(0.023)
+        } else if (num >= 4800 && num < 6400) {
+          return(0.031)
+        } else if (num >= 6400 && num < 8000) {
+          return(0.039)
+        } else if (num >= 8000 && num < 9600) {
+          return(0.046)
+        } else if (num >= 9600 && num < 11200) {
+          return(0.054)
+        } else if (num >= 11200 && num < 12800) {
+          return(0.061)
+        } else if (num >= 12800 && num < 14400) {
+          return(0.069)
+        } else if (num >= 14400 && num < 16000) {
+          return(0.076)
+        } else if (num >= 16000) {
+          return(0.08)
+        }
+      }
+      rate_est <- get_rate(length(sce@active.ident))
+      
+    } else if (basis == "Demuxlet") {
+      rate_est <- 0.018+8.4e-06*length(sce@active.ident) # Demuxlet  nExp = nNuc ∗（0.018 + 8.4 × 10−6∗ nNuc） https://www.nature.com/articles/nbt.4042 
+      
+    } else if (basis == "set") {
+      if (is.null(custom_rate)) {
+        stop("Please specify a value for custom_rate when basis is 'set'.")
+      }
+      rate_est <- custom_rate
+    }
+    
+    nExp_poi <- round(rate_est * nrow(sce@meta.data))
+    homotypic_prop <- modelHomotypic(sce$seurat_clusters)
+    nExp_poi_adj <- round(nExp_poi * (1 - homotypic_prop))
+    
+    sce <- doubletFinder(sce, 
+                         PCs=1:20, pN=0.25, 
+                         pK=pk_best, 
+                         nExp=nExp_poi_adj, 
+                         reuse.pANN = FALSE, sct=FALSE)
+    
+    colnames(sce@meta.data)[ncol(sce@meta.data) - 1] <- "Double_score"
+    colnames(sce@meta.data)[ncol(sce@meta.data)] <- "Is_Double"
+    
+  } 
+  else if (method == "scdblfinder") {
+    library(scDblFinder)
+    
+    db_rate = ncol(sce) / 1000 * 0.01
+    sce1 <- as.SingleCellExperiment(sce, assay = assay)
+    sce1 <- scDblFinder::scDblFinder(sce1, dbr = db_rate, verbose = FALSE)
+    sce[["scDblFinder_score"]] <- sce1[["scDblFinder.score"]]
+    sce[["scDblFinder_class"]] <- sce1[["scDblFinder.class"]] 
+  } 
+  else {
+    stop("Invalid method. Choose either 'doubletfinder' or 'scdblfinder'.")  
+  }
+  return(sce)  
+}
+
+```
+
+# 1.2 Load 10X data, QC, doublet detection and merge samples
+
+```{r, eval=FALSE}
+dn <- list.dirs("/home/yyyuxi/vascular/oridata",recursive = F)
+
+dt <- data.frame(dir = dn,sample = basename(dn))
+dt$dir <- paste(dt$dir,"outs/filtered_feature_bc_matrix",sep = "/")
+
+st <- list()
+for (i in 1:nrow(dt)) {
+  path <- dt$dir[i]
+  sample_name <- dt$sample[i]
+  
+  sce <- CreateSeuratObject(counts = Read10X(path))
+  sce <- add_meta(sce = sce, species = "rat")
+
+  sce <- subset(sce, subset = nFeature_RNA > 500 & nFeature_RNA < 5000 &
+                  percent.mt < 10 & percent.rpl < 10 & percent.rps < 10 & log10GenesPerUMI > 0.8)  # 质量控制
+  
+  sce <- rundoublet(sce, method='scdblfinder')
+  
+  sce$orig.ident <- sample_name
+  st[[sample_name]] <- sce
+}
+
+sce <- scCustomize::Merge_Seurat_List(st,add.cell.ids = names(st))
+sce <- JoinLayers(sce)
+sce$sample <- sce$orig.ident
+
+sce <- subset(sce, subset = scDblFinder_class == 'singlet' ) 
+
+sce <- sce %>%
+  Seurat::NormalizeData(verbose = FALSE) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData()
+
+sce <- RunPCA(sce,npcs = 20, verbose = FALSE)
+ElbowPlot(sce)
+
+sce <- RunHarmony(object = sce, group.by.vars = 'sample')
+sce <- FindNeighbors(sce, reduction = "harmony", dims = 1:20)
+sce <- FindClusters(sce, resolution = 0.8)
+
+sce <- RunUMAP(sce, reduction = "harmony", dims = 1:20)
+sce <- RunTSNE(sce, reduction = "harmony", dims = 1:20)
+
+DimPlot(sce,reduction = "umap",label = T,cols = mycolors1)
+
+logFCfilter=log2(1.5)
+adjPvalFilter=0.05
+all.cluster.markers <- FindAllMarkers(object = sce,only.pos = FALSE,min.pct = 0.25,logfc.threshold = logFCfilter)
+x=all.cluster.markers[(abs(as.numeric(as.vector(all.cluster.markers$avg_log2FC)))>logFCfilter & as.numeric(as.vector(all.cluster.markers$p_val_adj))<adjPvalFilter),]
+x <- x %>% dplyr::arrange(cluster,desc(avg_log2FC)) %>% dplyr::mutate(cluster = paste("c",cluster,"c",sep = "_"))
+filtered_x <- x[(x$avg_log2FC > 0 & x$pct.1 > 0.25) | (x$avg_log2FC < 0 & x$pct.2 > 0.25), ]
+
+obj_list <- list(sce = sce, marker = filtered_x)
+saveRDS(obj_list,
+        file = "/home/yyyuxi/vascular/ourdata/Tnc_vascular/sce_basic.rds")
+```
+
+# 1.3 Cell type annotation
+
+```{r}
+obj_list <- readRDS("/home/yyyuxi/vascular/ourdata/Tnc_vascular/sce_basic.rds")
+sce <- obj_list$sce
+marker <- obj_list$marker
+```
+
+
+```{r}
+marker_genes <- c(
+  # Adipocytes
+  "Cidec", "Adipoq",
+  # Endothelial cells
+  "Cdh5", "Vwf", "Gpihbp1",
+  # Fibroblasts
+  "Pdgfra", "Dcn", "Gsn", "Clec3b", "Lum",
+  # Macrophages
+  "Cd52", "Coro1a", "Btg1",
+  # Monocytes
+  "Csf1r", "Cd68", "Lyz2", "C1qa", "C1qb", "Pf4",
+  # Neural cells
+  "Mbp", "Gpm6b", "Cnp", "Prnp", "Vwa1",
+  # T cells
+  "Cd3e", "Tcf7",
+  # B cells
+  "Bank1", "Cd79a",
+  # Proliferating cells
+  "Top2a", "Mki67",
+  # Lymphatic endothelial cells
+  "Prox1",
+  # Neutrophils
+  "S100a8", "S100a9",
+  # NK cells
+  "Gzmk",
+  # Smooth muscle cells
+  "Cnn1", "Acta2", "Tagln", "Myh11", "Myl9", "Tpm2"
+)
+
+DotPlot(sce, marker_genes) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+
+```{r}
+sce <- subset(sce, subset = seurat_clusters != "15")
+
+# Cluster-to-celltype mapping
+sce$celltype <- plyr::mapvalues(sce$seurat_clusters,
+                                from = c(0:14, 16:19),
+                                to   = c(
+  "Homeostatic VSMC", "Fib", "Fib", "Homeostatic VSMC", "Macro",
+  "Endo", "Macro", "Osteoblast-like VSMC", "Fib", "Homeostatic VSMC",
+  "Homeostatic VSMC", "Macro", "T", "Neu", "Macro",
+  "Prolife Macro", "LEC", "Schwann", "Prolife"
+))
+sce$celltype <- factor(sce$celltype,
+                       levels = c("Homeostatic VSMC", "Osteoblast-like VSMC","Fib","Endo","LEC","Schwann",
+                                  "Macro","Prolife Macro", "Neu","T", "Prolife"))
+```
+
+
+```{r}
+# -----------------------------------------------------------------------------
+# VSMC subcluster annotation
+#   ecmVSMC : ECM-Regulatory VSMC
+#   strVSMC : Stress-Responsive VSMC
+#   rcVSMC  : Reinforced-Contractile VSMC
+#   OsVSMC  : Osteoblast-like VSMC
+# -----------------------------------------------------------------------------
+sce$subcell <- plyr::mapvalues(sce$seurat_clusters,
+                                from =  c(0:14,16:19),
+                                to = c("ecmVSMC", "Fib", "Fib", "strVSMC", "Macro", 
+                                       "Endo", "Macro", "OsVSMC", "Fib", "rcVSMC", 
+                                       "rcVSMC", "Macro", "T", "Neu", "Macro", 
+                                       "Prolife Macro", "LEC", "Schwann", "Prolife"))
+
+sce$subcell <- factor(sce$subcell,
+                       levels = c("rcVSMC","ecmVSMC", "strVSMC",  "OsVSMC", 
+                                  "Fib","Endo","LEC","Schwann",
+                                  "Macro","Prolife Macro", "Neu","T", "Prolife"))
+
+sce$group <- plyr::mapvalues(sce$sample, 
+                             from = c("C1", "C3", "NX1", "NX4"),
+                             to = c("Con","Con","NX","NX"))
+sce$group <- factor(sce$group,levels = c("Con","NX"))
+
+sce_all <- sce
+
+DimPlot(sce_all,label = T,cols = mycolors1,group.by = "celltype" )
+DimPlot(sce_all,label = T,cols = mycolors1,group.by = "subcell" )
+```
+
+
+```{r}
+# =============================================================================
+# Remove a small group of cells inside the VSMC subclusters
+# =============================================================================
+sce <- subset(sce_all, subset = celltype %in% c("Homeostatic VSMC", "Osteoblast-like VSMC") )
+DimPlot(sce,reduction = "umap",label = T,cols = mycolors1)+
+  geom_hline(yintercept = c(3.9), linetype=2, color="red")+
+  geom_vline(xintercept = c(0), linetype=2, color="red")
+
+ce1 <- sce@reductions[["umap"]]@cell.embeddings %>%  as.data.frame() %>%  dplyr::filter(umap_1 > 0 | umap_2 > 3.9) %>% rownames()
+sce$subcell <- as.vector(sce$subcell)
+sce@meta.data[ce1,"subcell"] <- "delete"
+
+sce <- subset(sce,subset = subcell != "delete")
+sce$subcell <- factor(sce$subcell,levels = c("rcVSMC","ecmVSMC", "strVSMC",  "OsVSMC"))
+
+DimPlot(sce,group.by = "subcell",label = T,cols = mycolors1)
+
+# Remove the same cells from the full object
+sce_all$subcell <- as.vector(sce_all$subcell)
+sce_all@meta.data[ce1,"subcell"] <- "delete"
+sce_all <- subset(sce_all,subset = subcell != "delete")
+sce_all$subcell <- factor(sce_all$subcell,
+                       levels = c("rcVSMC","ecmVSMC", "strVSMC",  "OsVSMC", 
+                                  "Fib","Endo","LEC","Schwann",
+                                  "Macro","Prolife Macro", "Neu","T", "Prolife"))
+```
+
+
+```{r, eval=FALSE}
+scelist <- list(sce_all = sce_all,
+                sceSMC = sce)
+
+saveRDS(scelist,file = "/home/yyyuxi/vascular/Tnc_vascular/sce_ann.rds")
+```
